@@ -1,0 +1,394 @@
+'******************************************************************************
+'
+' Script: ConveyorStatus.bcl
+'
+' Description: 
+' - 当机运行启停和FPS信号到后，更新动态报警信息。
+'
+'
+' 
+'******************************************************************************
+'Change Log:
+' ---Name---		---Date---- 	---Description of Change---
+' LuoKun   		    2008-09-10	 	Created for GA
+' LuoKun   		    2009-07-05	 	将机运线的数量由9条改为10条
+' LuoKun   		    2011-12-01	 	修改重复运行事件，状态信息显示不正确的BUG
+' LuoKun			2011-12-08		增加从数据库取该机运行BUFFER是否有效的标志
+'******************************************************************************
+
+Option Explicit
+
+' *** Constants ***
+
+Const gs_ScriptName		 	As String  = "ConveyorSignal"		'Script Name
+Const gs_PgmSuffix		 	As String  = "CONY"				'Script Suffix 
+Const gn_FOREVER			As Integer = -1
+Const gi_MaxConveyor		As Integer = 20
+
+
+' *** Structures ***
+
+
+' *** Globals ***
+
+Private gsProjectName		As String
+Private gsProjPrefix		As String
+Private gsLogFile			As String
+
+Private gaptAllPts() 		As Point   			'List of points to monitor for changes
+Private giEndProg			As Integer 			'Indexes into gaptAllPts()
+Private giPgmTerm			As Integer
+Private giPgmHrtbt			As Integer
+Private giCFGUpdate			As Integer			'设备配置状态修改点在数组中的序号 
+
+
+' *** Common Declares ***
+
+Declare Public Function ComGetProjectName() As String
+Declare Public Function ComGetScriptPrefix(ByVal vsAreaAndSub As String) As String
+Declare Public Function ComIsPointValid(ByVal vsPointName As String) As Boolean
+Declare Public Function ComAddToAllPts(ByRef raptAllPts() As Point, ByVal vsPointName As String) As Integer
+Declare Public Function SQLSel(ByVal strSQL As String, ByVal ColNum As Integer,ByRef Row() As Variant) As String
+Declare Public Function SQLExec(ByVal strSQL As String) As String
+Declare Public Sub ComLogMsg(ByVal vsLogFile As String, ByVal vsMsg As String)
+Declare Public Sub ComSetupNewPoint(ByVal vsPointName As String, ByRef rptPoint As Point)
+
+
+' *** Local Declares ***
+
+Declare Private Sub initialize()
+Declare Private Sub LoadDeivcePoints()
+Declare Private Sub LoadDeivceInformation()
+Declare Private Sub DevcieStatusChange(ByVal pDeviceID As String, ByVal pDeviceState As Boolean)
+
+
+Sub Main()
+	Dim ptChanged 	As Point		'临时变量，监控数组中每次变化的点
+	Dim ptTmstmp  	As New point	'时间戳点，每次心跳点变化时更新
+	Dim iDeviceID	As String		'当前状态变化的设备的ID号
+
+On Error GoTo MainErrHandler
+	'得到该脚本初始信息
+	gsProjectName = ComGetProjectName()
+	gsProjPrefix  = "\\" & gsProjectName & "\EVENT."
+	gsLogFile	  = Environ("SITE_ROOT") & "log\" & gs_PgmSuffix & "\" & gs_ScriptName
+
+	'如果该程序已经运行，则结束本次的调用.
+	If PointGet(gsProjPrefix & "V_RNNG_" & gs_PgmSuffix) = TRUE Then
+		Call ComLogMsg(gsLogFile, gs_ScriptName & " is already running, programme is ending execution.")
+		PointSet gsProjPrefix & "V_STPGM_" & gs_PgmSuffix, 0		'事件触发标志复位	
+		Exit Sub
+	End If	
+
+	PointSet gsProjPrefix & "V_RNNG_" & gs_PgmSuffix, 1	 		'程序运行标志置1
+	PointSet gsProjPrefix & "V_STPGM_" & gs_PgmSuffix, 0		'事件触发标志复位
+
+	ptTmstmp.ID = gsProjPrefix & "V_TMSTMP_" & gs_PgmSuffix		'脚本更新时间戳标志点赋初值
+	ptTmstmp.Get
+	ptTmstmp.SetValue = Format(Now(), "yyyy-mm-dd hh:mm:ss")
+
+	Call ComLogMsg(gsLogFile, "Program beginning execution")	'写脚本启动日志
+
+	Call Initialize()											'调用初始化函数
+
+	gaptAllPts(giEndProg).GetNext
+	gaptAllPts(giPgmTerm).GetNext
+	gaptAllPts(giCFGUpdate).GetNext
+
+	While (Not gaptAllPts(giEndProg).Value And Not gaptAllPts(giPgmTerm).Value)
+		Set ptChanged = PointGetNext(gn_FOREVER, gaptAllPts)	'get next change point
+
+		If ptChanged.State <> CP_UNAVAILABLE Then				'如果该点的状态可读
+			Select Case ptChanged.ID
+				
+			Case gaptAllPts(giPgmHrtbt).ID		'心跳点变化，更新时间戳
+				If ptChanged.Value Then
+					ptTmstmp.SetValue = Format(Now(), "yyyy-mm-dd hh:mm:ss")
+					ptChanged.SetValue = 0
+				End If
+
+			Case gaptAllPts(giEndProg).ID		'不处理
+
+			Case gaptAllPts(giPgmTerm).ID		'不处理
+			
+			Case gaptAllPts(giCFGUpdate).ID	   	'设备配置变化
+				Call LoadDeivceInformation() 	'更新设备信息
+				Call LoadDeivcePoints()			'将设备状态点加入内存数组中监控
+				
+			Case Else		 					'设备状态点变化
+			   	ptChanged.Get
+
+				If ptChanged.State <> CP_UNAVAILABLE Then
+					iDeviceID =  ptChanged.ID
+					Call DevcieStatusChange(iDeviceID, ptChanged.Value) 	'处理程序
+				End If
+			End Select
+
+		Else 
+			Call ComLogMsg(gsLogFile, ptChanged.ID & ",N/A") 		'异常情况，记录日志			
+		
+		End If	
+	Wend	
+	
+	Call ComLogMsg(gsLogFile, "Program terminating at user request")'写脚本停止日志
+
+	PointSet gsProjPrefix & "V_RNNG_" & gs_PgmSuffix, 0				'复位脚本启动标志
+	PointSet gsProjPrefix & "V_TERM_" & gs_PgmSuffix, 0				'
+
+	Exit Sub
+
+MainErrHandler:
+	LogStatus CIM_FAILURE, gs_ScriptName & ".bcl", error$, err, erl
+	Call ComLogMsg(gsLogFile, "Program terminating abnormally")
+	Call ComLogMsg(gsLogFile, "error$=" & error$ & " err=" & err & " erl=" & erl)
+
+	On Error Resume Next
+	PointSet gsProjPrefix & "V_RNNG_" & gs_PgmSuffix, 0
+
+End Sub
+
+
+'------------------------------------------------------------------------------------
+' Sub: Initialize()
+'
+' Notes: Setup all points which will be used and which will be monitored using
+'		 PointGetNext().
+'------------------------------------------------------------------------------------
+Private Sub Initialize()
+	ReDim gaptAllPts()
+
+	giEndProg  		= ComAddToAllPts(gaptAllPts, gsProjPrefix & "V_END_ALL_PROG")
+	giPgmTerm  		= ComAddToAllPts(gaptAllPts, gsProjPrefix & "V_TERM_"  & gs_PgmSuffix)
+	giPgmHrtbt 		= ComAddToAllPts(gaptAllPts, gsProjPrefix & "V_HRTBT_" & gs_PgmSuffix)
+
+	giCFGUpdate 	= ComAddToAllPts(gaptAllPts, "MONITOR." & gs_PgmSuffix & ".D_CFG_UPDATE")
+
+	Call LoadDeivceInformation() 	  		'更新设备信息
+	Call LoadDeivcePoints()				    '将设备状态点加入内存数组中监控
+End Sub
+
+
+'------------------------------------------------------------------------------------
+' Sub: LoadDeivcePoints()
+'
+'
+' Notes: 根据实际设备的数量和设备点的名称，将所有要监控的设备点添加到监控数组中。 
+'		 
+'------------------------------------------------------------------------------------
+Private Sub LoadDeivcePoints()
+	Dim iPtIndex 	As Integer
+	Dim sInPoint	As String
+	Dim iOp			As Integer
+	Dim ptTmstmp  	As New point 
+	Dim iAllPts		As Integer
+
+	For iPtIndex = 0 To (gi_MaxConveyor-1)
+
+		'input satus
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_FPS_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_RUN_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_REA_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		'output flag
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_SPA_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_SPP_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_SPS_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+		sInPoint = "MONITOR." & gs_PgmSuffix & ".STATUS.D_BRT_" & format(iPtIndex+1,"00")	
+		If ComIsPointValid(sInPoint) Then
+			iAllPts =  ComAddToAllPts(gaptAllPts, sInPoint)
+			iOp 	= iOp + 1
+		End If
+
+	Next iPtIndex 
+
+	If iOp = 0 Then
+		Call ComLogMsg(gsLogFile, "No Device Stat Point ")
+	End If
+End Sub
+
+
+'------------------------------------------------------------------------------------
+' Sub: LoadDeivceInformation()
+'
+' Notes: 根据实际设备的数量和设备点的名称，将常用的配置信息取到内存数组中。 
+'		 
+'------------------------------------------------------------------------------------
+Private Sub LoadDeivceInformation()
+	Dim pMyPoint 			As New point
+	Dim strSql				As String 
+	Dim avRow() 			As Variant
+	Dim iConveyorID			As Integer
+	Dim iIndex				As Integer
+	Dim sRetSQLInfo 		As String 
+	Dim sLastSetupTime		As String			'数据库中最后一次配置的更新时间
+	Dim asConveyorDesc(gi_MaxConveyor-1)		As String
+	Dim asConveyorBuff(gi_MaxConveyor-1)		As Boolean
+
+
+	'---1.从数据库中获取最新的机运线配置时间
+	strSql = "Select top 1 SetupTime From TM_ConveyorSignal_Par order by SetupTime DESC "
+	sRetSQLInfo = SQLSel(strSql,1,avRow()) 
+
+	If (sRetSQLInfo <> "") Then
+		'取信息失败错误处理
+		Call ComLogMsg(gsLogFile, sRetSQLInfo)						'取信息失败记录日志
+		Exit Sub
+	End If
+
+	If  ArrayDims(avRow)=0 Then	
+		'没有配置信息
+		Call ComLogMsg(gsLogFile,"数据库中无机运线配置信息!")		'没有质量台配置信息	
+	Else
+		'得到最后一次配置的时间戳
+		sLastSetupTime = avRow(0,0)
+	End If
+
+   	ReDim avRow() 		As Variant			'重定义数组
+
+	'---2.从数据库中获取最新的机运线配置信息
+	If sLastSetupTime <> "" Then
+ 		strSql = "Select TabA.ConveyorID,TabB.Name,Isnull(TabA.IsBufferExisted,0) " &_
+			" From TM_ConveyorSignal_Par as TabA " &_
+			" left join View_CurrConveyorPar as TabB on TabA.ConveyorID = TabB.ConveyorID " &_
+ 			" where TabA.SetupTime = '" & sLastSetupTime & "'"
+		
+		sRetSQLInfo = SQLSel(strSql,3,avRow())
+	
+		If (sRetSQLInfo <> "") Then
+			Call ComLogMsg(gsLogFile, sRetSQLInfo) 						'取信息失败记录日志
+			Exit Sub
+		End If
+
+		If ArrayDims(avRow)=0 Then	
+			Call ComLogMsg(gsLogFile,"数据库中无机运线配置信息!")			'没有配置信息
+		Else
+			'初始化描述
+			For iIndex = 0 To gi_MaxConveyor-1
+				asConveyorDesc(iIndex) = "Conveyor"
+			Next iIndex 
+
+			'将配置信息添加到数组中
+			For iIndex = 0 To (Ubound(avRow))
+				iConveyorID = avRow(iIndex,0) -1
+
+				If (iConveyorID >= 0) And (iConveyorID < gi_MaxConveyor) Then
+					asConveyorDesc(iConveyorID) = Leftb(avRow(iIndex,1),20)
+					asConveyorBuff(iConveyorID) = avRow(iIndex,2)
+				End If
+			Next iIndex
+		End If
+	End If
+
+	'---3.将配置信息更新到虚拟点中	
+	'设置机运线的描述信息
+	pMyPoint.Id="CONVEYOR.V_DESCRIPTION"
+	pMyPoint.SetArray asConveyorDesc
+	pMyPoint.Set 
+
+	'设置机运线的缓存区是否有效信息
+	pMyPoint.Id="CONVEYOR.V_BUFF_ON"
+	pMyPoint.SetArray asConveyorBuff
+	pMyPoint.Set 
+End Sub
+
+
+'------------------------------------------------------------------------------------
+' Sub: DevcieStatusChange()
+'
+' Notes: 当设备状态变化时，按照需要进行处理。 
+'		 
+'------------------------------------------------------------------------------------
+Private Sub DevcieStatusChange(ByVal pDeviceID As String, ByVal pDeviceState As Boolean)
+	Dim iConveyorID		As Integer
+	Dim sSignalKey		As String		'Run,FPS,Andon Stop Require
+	Dim sConveyorDesc	As String
+	Dim bSignalState	As Boolean
+	
+	iConveyorID		= Cint(right(pDeviceID,2))
+	bSignalState	= pDeviceState
+	sConveyorDesc   = PointGet("CONVEYOR.V_DESCRIPTION[" & iConveyorID - 1 & "]")
+	
+	sSignalKey = Mid(pDeviceID,23,3) 
+
+	Select Case sSignalKey
+	Case "RUN"	'Run
+		If bSignalState Then    '机运线启停	 
+			AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " is Running","",iConveyorID+100
+		Else
+			AlarmGenerate "","CONY_ALARM","$SYSTEM", "ID:" & iConveyorID & ", " & sConveyorDesc & " is Stop","",iConveyorID+100
+		End If
+
+	Case "FPS"		'FPS 到达
+		If bSignalState Then
+			PointSet "MONITOR.CONY.V_FPS_TIME[" & (iConveyorID - 1) & "]", Format(now,"yyyy-mm-dd HH:MM:SS")
+		End If
+
+	Case "REA"		'机运线准备信号
+		'If bSignalState Then
+		'	AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " is Running","",iConveyorID+300
+		'Else
+		'	AlarmGenerate "","CONY_ALARM","$SYSTEM", "ID:" & iConveyorID & ", " & sConveyorDesc & " is Stop","",iConveyorID+300
+		'End If
+
+
+	Case "SPA"		'andon Stop require 
+		If bSignalState Then
+		   	AlarmGenerate "","CONY_ALARM","$SYSTEM","ID:" & iConveyorID & ", " & sConveyorDesc & " - Anodn 请求停线！" ,"",iConveyorID+400   	
+		Else
+		   	AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " - Anodn 请求停线！" ,"",iConveyorID+400	
+		End If
+
+	Case "SPP" 		'production Stop require 
+		If bSignalState Then
+		   	AlarmGenerate "","CONY_ALARM","$SYSTEM","ID:" & iConveyorID & ", " & sConveyorDesc & " - 生产请求停线！" ,"",iConveyorID+500
+		Else
+			AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " - 生产请求停线！" ,"",iConveyorID+500
+		End If
+
+	Case "SPS" 		'Shift Stop require
+		If bSignalState Then   	
+			AlarmGenerate "","CONY_ALARM","$SYSTEM","ID:" & iConveyorID & ", " & sConveyorDesc & " - 作息请求停线！" ,"",iConveyorID+600
+		Else
+			AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " - 作息请求停线！" ,"",iConveyorID+600
+		End If
+
+	Case "BRT" 		'照明控制
+		If bSignalState Then   	
+			AlarmGenerate "","CONY_ALARM","$SYSTEM","ID:" & iConveyorID & ", " & sConveyorDesc & " - 照明控制请求！" ,"",iConveyorID+700
+		Else
+			AlarmUpdate "","CONY_ALARM","$SYSTEM",AM_ACKNOWLEDGED + AM_RESET , "ID:" & iConveyorID & ", " & sConveyorDesc & " - 照明控制请求！" ,"",iConveyorID+700
+		End If
+
+
+	End Select
+
+End Sub
